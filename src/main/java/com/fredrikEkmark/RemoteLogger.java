@@ -6,10 +6,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.*;
 
 public class RemoteLogger {
@@ -17,6 +14,7 @@ public class RemoteLogger {
     private static String defaultServiceName = "default-service";
     private static BlockingQueue<Event> queue;
     private static ScheduledExecutorService memoryScheduler;
+    private static final ThreadLocal<RequestContext> CONTEXT = new ThreadLocal<>();
     private static Thread workerThread;
     private static HttpClient httpClient;
     private static String apiEndpoint;
@@ -26,6 +24,16 @@ public class RemoteLogger {
     private static final String LOG_ENDPOINT = "/v1/logs";
     private static final String MEMORY_ENDPOINT = "/v1/metrics/memory";
     private static final String USAGE_ENDPOINT = "/v1/metrics/usage";
+
+    private static class RequestContext {
+        final String traceId;
+        final long startTimeNanos;
+
+        RequestContext(String traceId) {
+            this.traceId = traceId;
+            this.startTimeNanos = System.nanoTime();
+        }
+    }
 
     public sealed interface Event permits LogEvent, MemoryStatusEvent, UsageEvent {
         String toJson();
@@ -131,35 +139,42 @@ public class RemoteLogger {
 
     // --- Core Logging API ---
 
-    public static Usage startNewUsage() {
-        if (!initialized) {
-            System.err.println("[Logger] Uninitialized. Dropped.");
-            return null;
-        }
-        return new Usage();
+    public static void startUsage() {
+        startUsage(UUID.randomUUID().toString());
     }
 
-    protected static void endUsage(Usage usage) {
-        if (!initialized) {
-            System.err.println("[Logger] Uninitialized. Dropped usage log.");
+    public static void startUsage(String traceId) {
+        if (!initialized) return;
+        CONTEXT.set(new RequestContext(traceId));
+    }
+
+    public static void endUsage(String endpoint, int statusCode) {
+        if (!initialized) return;
+
+        RequestContext ctx = CONTEXT.get();
+        if (ctx == null) {
+            System.err.println("[Logger] Warning: endUsage called without startUsage on thread " + Thread.currentThread().getName());
             return;
         }
 
-        Instant endTime = Instant.now();
-        long latencyMs = Duration.between(usage.getStartTime(), endTime).toMillis();
+        try {
+            long latencyMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - ctx.startTimeNanos);
 
+            UsageEvent event = new UsageEvent(
+                    defaultServiceName,
+                    ctx.traceId,
+                    endpoint,
+                    latencyMs,
+                    statusCode,
+                    Instant.now()
+            );
 
-        UsageEvent event = new UsageEvent(
-                defaultServiceName,
-                usage.getTraceId(),
-                usage.getEndpoint(),
-                latencyMs,
-                usage.getStatusCode(),
-                endTime
-        );
-
-        if (!queue.offer(event)) {
-            System.err.println("[Logger] Queue full. Dropped usage log.");
+            if (!queue.offer(event)) {
+                System.err.println("[Logger] Queue full. Dropped usage event.");
+            }
+        } finally {
+            // CRITICAL: Always remove to prevent memory leaks in thread pools!
+            CONTEXT.remove();
         }
     }
 
@@ -205,15 +220,14 @@ public class RemoteLogger {
         log("DEBUG", message);
     }
 
-    public static void log(String level, String message) {
-        log(null, level, message);
-    }
-
-    protected static void log(String traceId, String level, String message) {
+    protected static void log(String level, String message) {
         if (!initialized) {
             System.err.println("[Logger] Uninitialized log. Dropped: [" + level + "] " + message);
             return;
         }
+
+        RequestContext ctx = CONTEXT.get();
+        String traceId = (ctx != null) ? ctx.traceId : null;
 
         LogEvent event = new LogEvent(defaultServiceName, traceId, level, message, Instant.now());
         if (!queue.offer(event)) {
