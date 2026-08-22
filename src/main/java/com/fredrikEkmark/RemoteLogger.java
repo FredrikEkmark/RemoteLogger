@@ -43,8 +43,11 @@ public class RemoteLogger {
     public record LogEvent(String serviceName, String traceId, String level, String message, Instant timestamp) implements Event {
         @Override
         public String toJson() {
-            return String.format("{\"serviceName\":\"%s\",\"traceId\":\"%s\",\"level\":\"%s\",\"message\":\"%s\",\"timestamp\":\"%s\"}",
-                    escapeJson(serviceName),escapeJson(traceId), escapeJson(level), escapeJson(message), timestamp.toString());
+            return "{\"serviceName\":\"" + escapeJson(serviceName) +
+                    "\",\"traceId\":\"" + escapeJson(traceId != null ? traceId : "") +
+                    "\",\"level\":\"" + escapeJson(level) +
+                    "\",\"message\":\"" + escapeJson(message) +
+                    "\",\"timestamp\":\"" + timestamp + "\"}";
         }
 
         @Override
@@ -53,20 +56,14 @@ public class RemoteLogger {
         }
     }
 
-    public record UsageEvent(String serviceName, String traceId, String endpoint, long latencyMs, int statusCode, Instant timestamp
-    ) implements Event {
-
+    public record UsageEvent(String serviceName, String traceId, long latencyMs, int statusCode, Instant timestamp) implements Event {
         @Override
         public String toJson() {
-            return String.format(
-                    "{\"serviceName\":\"%s\",\"traceId\":\"%s\",\"endpoint\":\"%s\",\"latencyMs\":%d,\"statusCode\":%d,\"timestamp\":\"%s\"}",
-                    escapeJson(serviceName),
-                    escapeJson(traceId != null ? traceId : ""),
-                    escapeJson(endpoint),
-                    latencyMs,
-                    statusCode,
-                    timestamp.toString()
-            );
+            return "{\"serviceName\":\"" + escapeJson(serviceName) +
+                    "\",\"traceId\":\"" + escapeJson(traceId != null ? traceId : "") +
+                    "\",\"latencyMs\":" + latencyMs +
+                    ",\"statusCode\":" + statusCode +
+                    ",\"timestamp\":\"" + timestamp + "\"}";
         }
 
         @Override
@@ -78,8 +75,12 @@ public class RemoteLogger {
     public record MemoryStatusEvent(String serviceName, long totalMemory, long freeMemory, long usedMemory, long maxMemory, Instant timestamp) implements Event {
         @Override
         public String toJson() {
-            return String.format("{\"serviceName\":\"%s\",\"totalMemory\":\"%s\",\"freeMemory\":\"%s\",\"usedMemory\":\"%s\",\"maxMemory\":\"%s\",\"timestamp\":\"%s\"}",
-                    escapeJson(serviceName), totalMemory, freeMemory, usedMemory, maxMemory, timestamp.toString());
+            return "{\"serviceName\":\"" + escapeJson(serviceName) +
+                    "\",\"totalMemory\":" + totalMemory +
+                    ",\"freeMemory\":" + freeMemory +
+                    ",\"usedMemory\":" + usedMemory +
+                    ",\"maxMemory\":" + maxMemory +
+                    ",\"timestamp\":\"" + timestamp + "\"}";
         }
 
         @Override
@@ -88,11 +89,8 @@ public class RemoteLogger {
         }
     }
 
-    /**
-     * Call this ONCE at application startup (e.g. main method or Spring @EventListener)
-     */
     public static synchronized void init(String serviceName, String endpointUrl) {
-        init(serviceName, endpointUrl, 5000, 60);
+        init(serviceName, endpointUrl, 2000, 60);
     }
 
     public static synchronized void init(String serviceName, String endpointUrl, int queueCapacity) {
@@ -117,7 +115,6 @@ public class RemoteLogger {
         workerThread.setDaemon(true);
         workerThread.start();
 
-        // Start background scheduler if interval > 0
         if (memoryIntervalSeconds > 0) {
             memoryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "logger-memory-scheduler");
@@ -148,12 +145,11 @@ public class RemoteLogger {
         CONTEXT.set(new RequestContext(traceId));
     }
 
-    public static void endUsage(String endpoint, int statusCode) {
+    public static void endUsage(int statusCode) {
         if (!initialized) return;
 
         RequestContext ctx = CONTEXT.get();
         if (ctx == null) {
-            System.err.println("[Logger] Warning: endUsage called without startUsage on thread " + Thread.currentThread().getName());
             return;
         }
 
@@ -163,39 +159,32 @@ public class RemoteLogger {
             UsageEvent event = new UsageEvent(
                     defaultServiceName,
                     ctx.traceId,
-                    endpoint,
                     latencyMs,
                     statusCode,
                     Instant.now()
             );
 
             if (!queue.offer(event)) {
-                System.err.println("[Logger] Queue full. Dropped usage event.");
+                System.err.println("[Logger] Queue full. Dropped usage event for traceId: " + ctx.traceId);
             }
         } finally {
-            // CRITICAL: Always remove to prevent memory leaks in thread pools!
             CONTEXT.remove();
         }
     }
 
     public static void logMemoryStatus() {
-        if (!initialized) {
-            System.err.println("[Logger] Uninitialized. Dropped memory status log.");
-            return;
-        }
+        if (!initialized) return;
 
         Runtime runtime = Runtime.getRuntime();
         long totalMemory = runtime.totalMemory();
         long freeMemory = runtime.freeMemory();
-        long usedMemory = totalMemory - freeMemory;
-        long maxMemory = runtime.maxMemory();
 
         MemoryStatusEvent event = new MemoryStatusEvent(
                 defaultServiceName,
                 totalMemory,
                 freeMemory,
-                usedMemory,
-                maxMemory,
+                totalMemory - freeMemory,
+                runtime.maxMemory(),
                 Instant.now()
         );
 
@@ -221,36 +210,31 @@ public class RemoteLogger {
     }
 
     protected static void log(String level, String message) {
-        if (!initialized) {
-            System.err.println("[Logger] Uninitialized log. Dropped: [" + level + "] " + message);
-            return;
-        }
+        if (!initialized) return;
 
         RequestContext ctx = CONTEXT.get();
         String traceId = (ctx != null) ? ctx.traceId : null;
 
         LogEvent event = new LogEvent(defaultServiceName, traceId, level, message, Instant.now());
+
         if (!queue.offer(event)) {
-            System.err.println("[Logger] Queue full. Dropped: [" + level + "] " + message);
+            System.err.println("[Logger] Queue full. Dropped [" + level + "]: " + message);
         }
     }
 
     // --- Dispatcher Worker ---
 
     private static void processQueue() {
-
-        List<Event> batch = new ArrayList<>();
+        List<Event> batch = new ArrayList<>(50);
 
         while (running || !queue.isEmpty()) {
             try {
                 Event event = queue.poll(500, TimeUnit.MILLISECONDS);
                 if (event != null) {
                     batch.add(event);
-                    queue.drainTo(batch, 49); // Polled up to 50 items per batch
+                    queue.drainTo(batch, 49);
 
-                    // Changed: Pass the polymorphic batch to the grouping dispatcher
                     sendBatchGrouped(batch);
-
                     batch.clear();
                 }
             } catch (InterruptedException e) {
@@ -266,18 +250,19 @@ public class RemoteLogger {
         if (batch.isEmpty()) return;
 
         Map<String, List<Event>> groupedEvents = new HashMap<>();
-        for (Event event : batch) {
+        for (int i = 0; i < batch.size(); i++) {
+            Event event = batch.get(i);
             groupedEvents
                     .computeIfAbsent(event.getEndpointSuffix(), k -> new ArrayList<>())
                     .add(event);
         }
 
-        for (Map.Entry<String, List<Event>> entry : groupedEvents.entrySet())
-        {
+        for (Map.Entry<String, List<Event>> entry : groupedEvents.entrySet()) {
             String endpointSuffix = entry.getKey();
             List<Event> eventsForEndpoint = entry.getValue();
 
-            StringBuilder json = new StringBuilder("[");
+            StringBuilder json = new StringBuilder(eventsForEndpoint.size() * 128);
+            json.append("[");
             for (int i = 0; i < eventsForEndpoint.size(); i++) {
                 json.append(eventsForEndpoint.get(i).toJson());
                 if (i < eventsForEndpoint.size() - 1) {
@@ -302,17 +287,37 @@ public class RemoteLogger {
     }
 
     private static String escapeJson(String raw) {
-        if (raw == null) return "";
-        return raw.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r");
+        if (raw == null || raw.isEmpty()) return "";
+
+        // Fast path for clean strings (avoids allocating new strings if no special chars)
+        boolean needsEscaping = false;
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (c == '\\' || c == '"' || c == '\n' || c == '\r' || c == '\t') {
+                needsEscaping = true;
+                break;
+            }
+        }
+        if (!needsEscaping) return raw;
+
+        StringBuilder sb = new StringBuilder(raw.length() + 8);
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            switch (c) {
+                case '\\' -> sb.append("\\\\");
+                case '"'  -> sb.append("\\\"");
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                case '\t' -> sb.append("\\t");
+                default   -> sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 
     private static void flushAndStop() {
         running = false;
 
-        // Gracefully shutdown the scheduler
         if (memoryScheduler != null) {
             memoryScheduler.shutdown();
             try {
