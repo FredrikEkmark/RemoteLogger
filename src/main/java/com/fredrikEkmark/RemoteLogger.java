@@ -7,32 +7,91 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.Map;
+import java.util.concurrent.*;
 
 public class RemoteLogger {
 
-    private static String defaultServiceName;
-    private static BlockingQueue<LogEvent> queue;
+    private static String defaultServiceName = "default-service";
+    private static BlockingQueue<Event> queue;
+    private static ScheduledExecutorService memoryScheduler;
     private static Thread workerThread;
     private static HttpClient httpClient;
     private static String apiEndpoint;
     private static volatile boolean running = false;
     private static volatile boolean initialized = false;
 
-    // Record for log items
-    public record LogEvent(String serviceName, String level, String message, Instant timestamp) {}
+    private static final String LOG_ENDPOINT = "/v1/logs";
+    private static final String MEMORY_ENDPOINT = "/v1/metrics/memory";
+    private static final String USAGE_ENDPOINT = "/v1/metrics/usage";
+
+    public sealed interface Event permits LogEvent, MemoryStatusEvent, UsageEvent {
+        String toJson();
+        String getEndpointSuffix();
+    }
+
+    public record LogEvent(String serviceName, String traceId, String level, String message, Instant timestamp) implements Event {
+        @Override
+        public String toJson() {
+            return String.format("{\"serviceName\":\"%s\",\"traceId\":\"%s\",\"level\":\"%s\",\"message\":\"%s\",\"timestamp\":\"%s\"}",
+                    escapeJson(serviceName),escapeJson(traceId), escapeJson(level), escapeJson(message), timestamp.toString());
+        }
+
+        @Override
+        public String getEndpointSuffix() {
+            return LOG_ENDPOINT;
+        }
+    }
+
+    public record UsageEvent(String serviceName, String traceId, String endpoint, long latencyMs, int statusCode, Instant timestamp
+    ) implements Event {
+
+        @Override
+        public String toJson() {
+            return String.format(
+                    "{\"serviceName\":\"%s\",\"traceId\":\"%s\",\"endpoint\":\"%s\",\"latencyMs\":%d,\"statusCode\":%d,\"timestamp\":\"%s\"}",
+                    escapeJson(serviceName),
+                    escapeJson(traceId != null ? traceId : ""),
+                    escapeJson(endpoint),
+                    latencyMs,
+                    statusCode,
+                    timestamp.toString()
+            );
+        }
+
+        @Override
+        public String getEndpointSuffix() {
+            return USAGE_ENDPOINT;
+        }
+    }
+
+    public record MemoryStatusEvent(String serviceName, long totalMemory, long freeMemory, long usedMemory, long maxMemory, Instant timestamp) implements Event {
+        @Override
+        public String toJson() {
+            return String.format("{\"serviceName\":\"%s\",\"totalMemory\":\"%s\",\"freeMemory\":\"%s\",\"usedMemory\":\"%s\",\"maxMemory\":\"%s\",\"timestamp\":\"%s\"}",
+                    escapeJson(serviceName), totalMemory, freeMemory, usedMemory, maxMemory, timestamp.toString());
+        }
+
+        @Override
+        public String getEndpointSuffix() {
+            return MEMORY_ENDPOINT;
+        }
+    }
 
     /**
      * Call this ONCE at application startup (e.g. main method or Spring @EventListener)
      */
     public static synchronized void init(String serviceName, String endpointUrl) {
-        init(serviceName, endpointUrl, 5000);
+        init(serviceName, endpointUrl, 5000, 60);
     }
 
     public static synchronized void init(String serviceName, String endpointUrl, int queueCapacity) {
+        init(serviceName, endpointUrl, queueCapacity, 60);
+    }
+
+    public static synchronized void init(String serviceName, String endpointUrl, int queueCapacity, int memoryIntervalSeconds) {
         if (initialized) {
             System.err.println("[Logger] Warning: Logger is already initialized.");
             return;
@@ -50,11 +109,85 @@ public class RemoteLogger {
         workerThread.setDaemon(true);
         workerThread.start();
 
+        // Start background scheduler if interval > 0
+        if (memoryIntervalSeconds > 0) {
+            memoryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "logger-memory-scheduler");
+                t.setDaemon(true);
+                return t;
+            });
+
+            memoryScheduler.scheduleAtFixedRate(
+                    RemoteLogger::logMemoryStatus,
+                    memoryIntervalSeconds,
+                    memoryIntervalSeconds,
+                    TimeUnit.SECONDS
+            );
+        }
+
         Runtime.getRuntime().addShutdownHook(new Thread(RemoteLogger::flushAndStop));
         initialized = true;
     }
 
     // --- Core Logging API ---
+
+    public static Usage startNewUsage() {
+        if (!initialized) {
+            System.err.println("[Logger] Uninitialized. Dropped.");
+            return null;
+        }
+        return new Usage();
+    }
+
+    protected static void endUsage(Usage usage) {
+        if (!initialized) {
+            System.err.println("[Logger] Uninitialized. Dropped usage log.");
+            return;
+        }
+
+        Instant endTime = Instant.now();
+        long latencyMs = Duration.between(usage.getStartTime(), endTime).toMillis();
+
+
+        UsageEvent event = new UsageEvent(
+                defaultServiceName,
+                usage.getTraceId(),
+                usage.getEndpoint(),
+                latencyMs,
+                usage.getStatusCode(),
+                endTime
+        );
+
+        if (!queue.offer(event)) {
+            System.err.println("[Logger] Queue full. Dropped usage log.");
+        }
+    }
+
+    public static void logMemoryStatus() {
+        if (!initialized) {
+            System.err.println("[Logger] Uninitialized. Dropped memory status log.");
+            return;
+        }
+
+        Runtime runtime = Runtime.getRuntime();
+        long totalMemory = runtime.totalMemory();
+        long freeMemory = runtime.freeMemory();
+        long usedMemory = totalMemory - freeMemory;
+        long maxMemory = runtime.maxMemory();
+
+        MemoryStatusEvent event = new MemoryStatusEvent(
+                defaultServiceName,
+                totalMemory,
+                freeMemory,
+                usedMemory,
+                maxMemory,
+                Instant.now()
+        );
+
+        if (!queue.offer(event)) {
+            System.err.println("[Logger] Queue full. Dropped memory status log.");
+        }
+    }
 
     public static void info(String message) {
         log("INFO", message);
@@ -73,28 +206,37 @@ public class RemoteLogger {
     }
 
     public static void log(String level, String message) {
+        log(null, level, message);
+    }
+
+    protected static void log(String traceId, String level, String message) {
         if (!initialized) {
-            System.err.println("[Logger] Uninitialized log drop: [" + level + "] " + message);
+            System.err.println("[Logger] Uninitialized log. Dropped: [" + level + "] " + message);
             return;
         }
 
-        LogEvent event = new LogEvent(defaultServiceName, level, message, Instant.now());
+        LogEvent event = new LogEvent(defaultServiceName, traceId, level, message, Instant.now());
         if (!queue.offer(event)) {
-            System.err.println("[Logger] Queue full. Dropped: " + message);
+            System.err.println("[Logger] Queue full. Dropped: [" + level + "] " + message);
         }
     }
 
     // --- Dispatcher Worker ---
 
     private static void processQueue() {
-        List<LogEvent> batch = new ArrayList<>();
+
+        List<Event> batch = new ArrayList<>();
+
         while (running || !queue.isEmpty()) {
             try {
-                LogEvent event = queue.poll(500, TimeUnit.MILLISECONDS);
+                Event event = queue.poll(500, TimeUnit.MILLISECONDS);
                 if (event != null) {
                     batch.add(event);
-                    queue.drainTo(batch, 49);
-                    sendBatch(batch);
+                    queue.drainTo(batch, 49); // Polled up to 50 items per batch
+
+                    // Changed: Pass the polymorphic batch to the grouping dispatcher
+                    sendBatchGrouped(batch);
+
                     batch.clear();
                 }
             } catch (InterruptedException e) {
@@ -106,31 +248,42 @@ public class RemoteLogger {
         }
     }
 
-    private static void sendBatch(List<LogEvent> batch) {
+    private static void sendBatchGrouped(List<Event> batch) {
         if (batch.isEmpty()) return;
 
-        StringBuilder json = new StringBuilder("[");
-        for (int i = 0; i < batch.size(); i++) {
-            LogEvent e = batch.get(i);
-            json.append(String.format(
-                    "{\"serviceName\":\"%s\",\"level\":\"%s\",\"message\":\"%s\",\"timestamp\":\"%s\"}",
-                    escapeJson(e.serviceName()), escapeJson(e.level()), escapeJson(e.message()), e.timestamp()
-            ));
-            if (i < batch.size() - 1) json.append(",");
+        Map<String, List<Event>> groupedEvents = new HashMap<>();
+        for (Event event : batch) {
+            groupedEvents
+                    .computeIfAbsent(event.getEndpointSuffix(), k -> new ArrayList<>())
+                    .add(event);
         }
-        json.append("]");
 
-        try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(apiEndpoint))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(json.toString()))
-                    .timeout(Duration.ofSeconds(5))
-                    .build();
+        for (Map.Entry<String, List<Event>> entry : groupedEvents.entrySet())
+        {
+            String endpointSuffix = entry.getKey();
+            List<Event> eventsForEndpoint = entry.getValue();
 
-            httpClient.sendAsync(request, HttpResponse.BodyHandlers.discarding());
-        } catch (Exception e) {
-            System.err.println("[Logger] HTTP send failed: " + e.getMessage());
+            StringBuilder json = new StringBuilder("[");
+            for (int i = 0; i < eventsForEndpoint.size(); i++) {
+                json.append(eventsForEndpoint.get(i).toJson());
+                if (i < eventsForEndpoint.size() - 1) {
+                    json.append(",");
+                }
+            }
+            json.append("]");
+
+            try {
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(apiEndpoint + endpointSuffix))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(json.toString()))
+                        .timeout(Duration.ofSeconds(5))
+                        .build();
+
+                httpClient.sendAsync(request, HttpResponse.BodyHandlers.discarding());
+            } catch (Exception e) {
+                System.err.println("[Logger] HTTP send failed for " + endpointSuffix + ": " + e.getMessage());
+            }
         }
     }
 
@@ -144,6 +297,17 @@ public class RemoteLogger {
 
     private static void flushAndStop() {
         running = false;
+
+        // Gracefully shutdown the scheduler
+        if (memoryScheduler != null) {
+            memoryScheduler.shutdown();
+            try {
+                if (!memoryScheduler.awaitTermination(1, TimeUnit.SECONDS)) {
+                    memoryScheduler.shutdownNow();
+                }
+            } catch (InterruptedException ignored) {}
+        }
+
         if (workerThread != null) {
             try {
                 workerThread.join(2000);
