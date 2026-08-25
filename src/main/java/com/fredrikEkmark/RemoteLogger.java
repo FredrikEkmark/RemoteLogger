@@ -132,6 +132,7 @@ public class RemoteLogger {
 
         Runtime.getRuntime().addShutdownHook(new Thread(RemoteLogger::flushAndStop));
         initialized = true;
+        log("INFO", "Logger initialized for service: " + serviceName);
     }
 
     // --- Core Logging API ---
@@ -143,6 +144,7 @@ public class RemoteLogger {
     public static void startUsage(String traceId) {
         if (!initialized) return;
         CONTEXT.set(new RequestContext(traceId));
+        log("INFO", "Usage started for traceId: " + traceId);
     }
 
     public static void endUsage(int statusCode) {
@@ -168,6 +170,7 @@ public class RemoteLogger {
                 System.err.println("[Logger] Queue full. Dropped usage event for traceId: " + ctx.traceId);
             }
         } finally {
+            log("INFO", "Usage ended for traceId: " + ctx.traceId + " with status code: " + statusCode);
             CONTEXT.remove();
         }
     }
@@ -316,6 +319,7 @@ public class RemoteLogger {
     }
 
     private static void flushAndStop() {
+        log("INFO", "Flushing logs and stopping logger...");
         running = false;
 
         if (memoryScheduler != null) {
